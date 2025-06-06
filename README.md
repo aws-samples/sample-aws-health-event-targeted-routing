@@ -19,7 +19,6 @@ The solution offers several powerful capabilities that streamline operations and
   6. Resilient Message Processing: Implements dead letter queues with configurable retry policies to handle processing failures, ensuring no events are lost and enabling administrators to troubleshoot problematic events.
   7. Secure Credential Management: Uses AWS Secrets Manager to securely store and manage Jira authentication credentials, eliminating hardcoded secrets and supporting credential rotation without code changes.
 
-
 ## Architecture
 
 ![Architecture Diagram](./images/image1.png)
