@@ -1,0 +1,615 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'CloudFormation template for AWS Health Event to JIRA Integration'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Deployment Configuration"
+        Parameters:
+          - DeployModel
+          - AssumeRoleName
+          - TagKey
+      - Label:
+          default: "Jira Configuration"
+        Parameters:
+          - JiraBaseUrl
+          - JiraUserEmail
+          - JiraApiToken
+      - Label:
+          default: "Lambda Code Location"
+        Parameters:
+          - S3BucketName
+          - HealthEventProcessorKey
+          - JiraIntegrationKey
+    ParameterLabels:
+      DeployModel:
+        default: "Deployment Model"
+      AssumeRoleName:
+        default: "Assume Role Name"
+      TagKey:
+        default: "Tag Key to Monitor"
+      # Add other parameter labels as needed
+Parameters:
+  DeployModel:
+    Type: String
+    AllowedValues: 
+      - Account
+      - Service
+      - Tag
+    Description: Select the deployment model for Jira Integration (Account, Service, Tag)
+  
+  AssumeRoleName:
+    Type: String
+    Description: |
+      (Required only if DeploymentModel is Tag) 
+      Name of the IAM role to assume in Tag deployment model for cross account resource tag listing
+    MinLength: 0
+    MaxLength: 64
+    AllowedPattern: "^$|^[\\w+=,.@-]+$"  # Allow empty string or valid role name
+    ConstraintDescription: Role name must be empty or contain only alphanumeric and [+=,.@-] characters
+    Default: ""
+
+  TagKey:
+    Type: String
+    Description: |
+      (Required only if DeploymentModel is Tag) 
+      The tag key to monitor for routing Health events (e.g., 'Environment', 'Application', 'Team')
+    MinLength: 0
+    MaxLength: 128
+    AllowedPattern: "^$|^[\\w+=,.@-]+$"  # Allow empty string or valid role name
+    ConstraintDescription: Tag key must be empty or contain only alphanumeric and [+=,.@-] characters
+    Default: ""
+
+  JiraBaseUrl:
+    Type: String
+    Description: JIRA base URL (e.g., https://your-domain.atlassian.net)
+
+  JiraUserEmail:
+    Type: String
+    Description: JIRA user email address
+    NoEcho: true
+
+  JiraApiToken:
+    Type: String
+    Description: JIRA API token
+    NoEcho: true
+  
+  S3BucketName:
+    Type: String
+    Description: S3 bucket containing Lambda code
+
+  HealthEventProcessorKey:
+    Type: String
+    Description: S3 key for Health Event Processor Lambda code zip file
+
+  JiraIntegrationKey:
+    Type: String
+    Description: S3 key for Jira Integration Lambda code zip file
+
+
+Rules:
+  ValidateAssumeRoleName:
+    RuleCondition: !Equals 
+      - !Ref DeployModel
+      - 'Tag'
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AssumeRoleName, ""]]
+        AssertDescription: AssumeRoleName is required when DeploymentModel is Tag
+      - Assert: !Not [!Equals [!Ref TagKey, ""]]
+        AssertDescription: TagKey is required when DeploymentModel is Tag
+
+Conditions:
+  IsAccountModel: !Equals [!Ref DeployModel, 'Account']
+  IsServiceModel: !Equals [!Ref DeployModel, 'Service']
+  IsTagModel: !Equals [!Ref DeployModel, 'Tag']
+
+Resources:
+  AccountJiraTable:
+    Condition: IsAccountModel
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: Account
+          AttributeType: S
+        - AttributeName: ACJiraProjectKey
+          AttributeType: S
+        - AttributeName: ACJiraIssueTypeID
+          AttributeType: N
+      KeySchema:
+        - AttributeName: Account
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ACkeyIndex
+          KeySchema:
+            - AttributeName: ACJiraProjectKey
+              KeyType: HASH
+            - AttributeName: ACJiraIssueTypeID
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+
+  ServiceJiraTable:
+    Condition: IsServiceModel
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: Service
+          AttributeType: S
+        - AttributeName: SJiraProjectKey
+          AttributeType: S
+        - AttributeName: SJiraIssueTypeID
+          AttributeType: N
+      KeySchema:
+        - AttributeName: Service
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: SkeyIndex
+          KeySchema:
+            - AttributeName: SJiraProjectKey
+              KeyType: HASH
+            - AttributeName: SJiraIssueTypeID
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+
+  TagJiraTable:
+    Condition: IsTagModel
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: HostTag
+          AttributeType: S
+        - AttributeName: HTJiraProjectKey
+          AttributeType: S
+        - AttributeName: HTJiraIssueTypeID
+          AttributeType: N
+      KeySchema:
+        - AttributeName: HostTag
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: HTkeyIndex
+          KeySchema:
+            - AttributeName: HTJiraProjectKey
+              KeyType: HASH
+            - AttributeName: HTJiraIssueTypeID
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+
+  TrackEventTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: eventArn
+          AttributeType: S
+        - AttributeName: ticketId
+          AttributeType: S
+        - AttributeName: resourceArn
+          AttributeType: S
+      KeySchema:
+        - AttributeName: resourceArn
+          KeyType: HASH
+        - AttributeName: eventArn
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: TETkeyIndex
+          KeySchema:
+            - AttributeName: eventArn
+              KeyType: HASH
+            - AttributeName: ticketId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expirationTime
+        Enabled: true
+
+  # Secrets Manager for JIRA Credentials
+  JiraTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: JIRA credentials for AWS Health Event integration
+      SecretString: !Sub |
+        {
+          "jira_user_email": "${JiraUserEmail}",
+          "jira_api_token": "${JiraApiToken}"
+        }
+
+  # SQS Queue and DLQ
+  HealthEventIngestionDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-HealthEventIngestion-DLQ'
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  HealthEventIngestionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-HealthEventIngestionQueue'
+      VisibilityTimeout: 300  # 5 minutes, # > Lambda timeout
+      MessageRetentionPeriod: 345600  # 4 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt HealthEventIngestionDLQ.Arn
+        maxReceiveCount: 3
+
+  # Health Event Processor Lambda
+  HealthEventProcessorFunction:
+    Type: AWS::Lambda::Function
+    # DependsOn: HealthEventProcessorRole
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-health-event-processor'
+      Runtime: python3.9
+      Handler: HealthEventProcessorLambda.lambda_handler 
+      Code:
+        S3Bucket: !Ref S3BucketName
+        S3Key: !Ref HealthEventProcessorKey
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+          SQS_QUEUE_URL: !Ref HealthEventQueue
+          DYNAMODB_TRACK_TABLE: !Ref TrackEventTable
+          JIRA_DYNAMODB_TABLE: !If 
+            - IsAccountModel
+            - !Ref AccountJiraTable
+            - !If 
+              - IsServiceModel
+              - !Ref ServiceJiraTable
+              - !Ref TagJiraTable
+          DEPLOY_MODEL: !Ref DeployModel
+          ASSUME_ROLE_NAME: !If 
+            - IsTagModel
+            - !Ref AssumeRoleName
+            - !Ref "AWS::NoValue"
+          TAG_KEY: !If 
+            - IsTagModel
+            - !Ref TagKey
+            - !Ref "AWS::NoValue"
+      MemorySize: 256
+      Timeout: 240
+      Role: !GetAtt HealthEventProcessorRole.Arn
+
+ # Event Source Mapping to trigger Lambda from SQS
+  HealthEventProcessorEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt HealthEventIngestionQueue.Arn
+      FunctionName: !Ref HealthEventProcessorFunction
+      MaximumBatchingWindowInSeconds: 60  # 1 minutes
+# SQS Queue for Health Events
+  HealthEventQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-health-event-queue'
+      VisibilityTimeout: 300  # > Lambda timeout
+      MessageRetentionPeriod: 345600
+      # Optional: Dead Letter Queue configuration
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt HealthEventDLQ.Arn
+        maxReceiveCount: 3
+
+  # Dead Letter Queue for failed messages
+  HealthEventDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-health-event-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  HealthEventIngestionQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref HealthEventIngestionQueue
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: events.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt HealthEventIngestionQueue.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !GetAtt HealthEventRule.Arn
+
+  # Jira Integration Lambda
+  JiraIntegrationFunction:
+    Type: AWS::Lambda::Function
+    # DependsOn: JiraIntegrationRole
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-health-event-jira-integration'
+      Runtime: python3.9
+      Handler: HealthEventJiraIntegration.lambda_handler 
+      Code:
+        S3Bucket: !Ref S3BucketName
+        S3Key: !Ref JiraIntegrationKey
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+          JIRA_DYNAMODB_TABLE: !If 
+            - IsAccountModel
+            - !Ref AccountJiraTable
+            - !If 
+              - IsServiceModel
+              - !Ref ServiceJiraTable
+              - !Ref TagJiraTable
+          DYNAMODB_TRACK_TABLE: !Ref TrackEventTable
+          JIRA_SECRET_NAME: !Ref JiraTokenSecret
+          JIRA_BASE_URL: !Ref JiraBaseUrl
+          DEPLOY_MODEL: !Ref DeployModel
+          ASSUME_ROLE_NAME: !If 
+            - IsTagModel
+            - !Ref AssumeRoleName
+            - !Ref "AWS::NoValue"
+          TAG_KEY: !If 
+            - IsTagModel
+            - !Ref TagKey
+            - !Ref "AWS::NoValue"
+      MemorySize: 256
+      Timeout: 240
+      Role: !GetAtt JiraIntegrationRole.Arn
+
+  # SQS Event Source Mapping for Jira Integration Lambda
+  JiraIntegrationEventMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt HealthEventQueue.Arn
+      FunctionName: !Ref JiraIntegrationFunction
+      MaximumBatchingWindowInSeconds: 60  # 1 minutes
+
+  # IAM Roles
+  HealthEventProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # RoleName: !Sub '${AWS::StackName}-processor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt HealthEventIngestionQueue.Arn
+        
+        - PolicyName: HealthEventProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AWSHealthAccess
+                Effect: Allow
+                Action:
+                  - health:DescribeEvents
+                  - health:DescribeEventDetails
+                  - health:DescribeAffectedEntities
+                Resource: !Sub "arn:aws:health:${AWS::Region}::*"
+              - !If
+                - IsTagModel
+                - Sid: CrossAccountAssumeRole
+                  Effect: Allow
+                  Action:
+                    - sts:AssumeRole
+                  Resource: !Sub 'arn:aws:iam::*:role/${AssumeRoleName}'
+                - !Ref AWS::NoValue
+              - Sid: TagAccess
+                Effect: Allow
+                Action:
+                  - tag:GetResources
+                  - tag:GetTagKeys
+                  - tag:GetTagValues
+                Resource: '*'
+              - Sid: SQSAccess
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt HealthEventQueue.Arn
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:PutItem
+                Resource:
+                  - !GetAtt TrackEventTable.Arn
+                  - !Sub '${TrackEventTable.Arn}/index/*'
+                  - !If 
+                    - IsAccountModel
+                    - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountJiraTable}'
+                    - !If 
+                      - IsServiceModel
+                      - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ServiceJiraTable}'
+                      - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TagJiraTable}'
+                  - !If 
+                    - IsAccountModel
+                    - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountJiraTable}/index/*'
+                    - !If 
+                      - IsServiceModel
+                      - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ServiceJiraTable}/index/*'
+                      - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TagJiraTable}/index/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-processor-role'
+
+  JiraIntegrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # RoleName: !Sub '${AWS::StackName}-jira-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: JiraIntegrationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SQSAccess
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt HealthEventQueue.Arn
+              - Sid: SecretsManagerAccess
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: 
+                  - !Ref JiraTokenSecret
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${JiraTokenSecret}*'
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:PutItem
+                Resource:
+                  - !GetAtt TrackEventTable.Arn
+                  - !Sub '${TrackEventTable.Arn}/index/*'
+                  - !If 
+                    - IsAccountModel
+                    - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountJiraTable}'
+                    - !If 
+                      - IsServiceModel
+                      - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ServiceJiraTable}'
+                      - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TagJiraTable}'
+                  - !If 
+                    - IsAccountModel
+                    - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountJiraTable}/index/*'
+                    - !If 
+                      - IsServiceModel
+                      - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ServiceJiraTable}/index/*'
+                      - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TagJiraTable}/index/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-jira-role'
+
+  #Custom Event Bus
+  HealthEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${AWS::StackName}-custom-health-event-bus'
+
+  # EventBridge Rule
+  HealthEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-health-event-rule'
+      Description: 'Capture AWS Health scheduled change events'
+      EventBusName: !Ref HealthEventBus  # Reference to the custom event bus
+      EventPattern:
+        source:
+          - aws.health
+        detail-type:
+          - AWS Health Event
+        detail:
+          eventTypeCategory:
+            - scheduledChange
+          eventTypeCode:
+            - { "suffix": { "equals-ignore-case": "_PLANNED_LIFECYCLE_EVENT" }}
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt HealthEventIngestionQueue.Arn
+          Id: HealthEventIngestionQueue
+
+
+  # Lambda Permission for EventBridge
+  EventBridgePermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        Action: lambda:InvokeFunction
+        FunctionName: !Ref HealthEventProcessorFunction
+        Principal: events.amazonaws.com
+        SourceArn: !GetAtt HealthEventRule.Arn
+
+Outputs:
+  DeployModel:
+    Description: Selected deployment model for Jira Integration
+    Value: !Ref DeployModel
+
+
+  DynamoDBTable:
+    Description: Name of the DynamoDB table
+    Value: !If 
+      - IsAccountModel
+      - !Ref AccountJiraTable
+      - !If 
+        - IsServiceModel
+        - !Ref ServiceJiraTable
+        - !Ref TagJiraTable
+
+  DynamoDBTrackTable:
+    Description: Name of the DynamoDB table used for event tracking
+    Value: !Ref TrackEventTable
+
+  EventBridgeRuleName:
+    Description: Name of the EventBridge rule
+    Value: !Ref HealthEventRule
+
+  SecretName:
+    Description: Name of the Secret in Secrets Manager
+    Value: !Ref JiraTokenSecret
+
+  HealthEventQueueURL:
+    Description: URL of the SQS queue
+    Value: !Ref HealthEventQueue
+
+  HealthEventIngestionQueueURL:
+    Description: URL of the SQS queue
+    Value: !Ref HealthEventIngestionQueue
+
+  HealthEventQueueARN:
+    Description: ARN of the SQS queue
+    Value: !GetAtt HealthEventQueue.Arn
+
+  HealthEventDLQURL:
+    Description: URL of the Dead Letter Queue
+    Value: !Ref HealthEventDLQ
+
+  HealthEventProcessorFunctionArn:
+    Description: ARN of the Health Event Processor Lambda function
+    Value: !GetAtt HealthEventProcessorFunction.Arn
+
+  JiraIntegrationFunctionArn:
+    Description: ARN of the Jira Integration Lambda function
+    Value: !GetAtt JiraIntegrationFunction.Arn
